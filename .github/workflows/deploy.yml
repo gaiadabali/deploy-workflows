@@ -1,0 +1,247 @@
+# Gaia-Digital-Agency/deploy-workflows/.github/workflows/deploy.yml
+#
+# The single copy of the build logic. Client repos call it with ~8 lines, so a
+# fix here reaches every repo instead of needing 191 edits.
+#
+# Branch decides the target environment:
+#   staging -> delphi        production -> helios
+#   dev / main              build only, nothing deployed
+#
+# It builds, packages, and publishes a release asset. It never touches a server —
+# each server polls for the artifact and pulls it itself.
+
+name: Build and publish deploy artifact
+
+on:
+  workflow_call:
+    inputs:
+      site_type:
+        description: 'wordpress | static | node'
+        required: true
+        type: string
+      theme:
+        description: 'Theme directory name (wordpress only)'
+        required: false
+        type: string
+        default: ''
+      theme_path:
+        description: >
+          Where the theme lives in THIS repo. Two layouts exist across the estate:
+          a full WP webroot (leave blank -> wp-content/themes/<theme>), or a
+          theme-only repo where the theme is the repo root (set to ".").
+        required: false
+        type: string
+        default: ''
+      build_dir:
+        description: 'Directory the build produces (static/node)'
+        required: false
+        type: string
+        default: 'dist'
+      node_version:
+        required: false
+        type: string
+        default: '22'
+      build_command:
+        description: 'Override if the project does not use `npm run build`'
+        required: false
+        type: string
+        default: 'npm run build'
+
+concurrency:
+  # One build per repo per branch. A second push waits rather than racing.
+  group: deploy-${{ github.repository }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # needed to publish the release asset
+
+    steps:
+      - name: Resolve environment from branch
+        id: env
+        run: |
+          # Four branches:
+          #
+          #   dev         development     build verified, nothing published
+          #   main        integration     publishes deploy/main-*      (old servers)
+          #   staging     client review   publishes deploy/staging-*   -> delphi
+          #   production  live, approved  publishes deploy/production-* -> helios
+          #
+          # main keeps producing an artifact so the old servers stay first-class:
+          # whatever main contains is packaged exactly as before, and an old box can
+          # be pointed at deploy/main-* whenever we choose, with no workflow change.
+          # Publishing is inert on its own — a server only acts on the one prefix it
+          # is configured for, so delphi (staging) and helios (production) ignore
+          # deploy/main-* entirely.
+          case "${{ github.ref_name }}" in
+            dev)
+              echo "name=dev"                    >> "$GITHUB_OUTPUT"
+              echo "publish=false"               >> "$GITHUB_OUTPUT" ;;
+            main)
+              echo "name=main"                   >> "$GITHUB_OUTPUT"
+              echo "publish=true"                >> "$GITHUB_OUTPUT" ;;
+            staging)
+              echo "name=staging"                >> "$GITHUB_OUTPUT"
+              echo "publish=true"                >> "$GITHUB_OUTPUT" ;;
+            production)
+              echo "name=production"             >> "$GITHUB_OUTPUT"
+              echo "publish=true"                >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::Branch '${{ github.ref_name }}' is not a build branch (expected dev, main, staging or production)"
+              exit 1 ;;
+          esac
+
+          # Resolve where the theme lives in this repo. Two layouts exist:
+          # a full WP webroot, or a theme-only repo whose root IS the theme.
+          if [ "${{ inputs.site_type }}" = "wordpress" ]; then
+            tp="${{ inputs.theme_path }}"
+            if [ -z "$tp" ]; then tp="wp-content/themes/${{ inputs.theme }}"; fi
+            echo "theme_dir=$tp" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Check .gaiadeploy.yml exists and is valid YAML
+        run: |
+          # Deliberately only a guard. The workflow does not parse the targets —
+          # each receiving server reads this file itself from the repo at the
+          # pushed SHA, using its own read-only App token. That keeps one build
+          # serving any number of servers (new and old) with no workflow change,
+          # and keeps the artifact free of deploy-target detail.
+          if [ ! -f .gaiadeploy.yml ]; then
+            echo "::error::.gaiadeploy.yml is missing — see Gaia-Digital-Agency/deploy-workflows README"
+            exit 1
+          fi
+          python3 -c "import sys,yaml; yaml.safe_load(open('.gaiadeploy.yml'))" \
+            || { echo "::error::.gaiadeploy.yml is not valid YAML"; exit 1; }
+
+      # ---- build: one path per site type -------------------------------------
+
+      - uses: actions/setup-node@v4
+        if: inputs.site_type != 'wordpress' || inputs.theme != ''
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            ${{ steps.env.outputs.theme_dir }}/package-lock.json
+
+      - name: Build — WordPress theme
+        if: inputs.site_type == 'wordpress'
+        working-directory: ${{ steps.env.outputs.theme_dir }}
+        run: |
+          [ -n "${{ inputs.theme }}" ] || { echo "::error::site_type=wordpress requires the 'theme' input"; exit 1; }
+          # Prefer `npm ci` for reproducibility, but do not let a legacy repo with
+          # a drifted lockfile block its own deploy. Warn loudly instead — the fix
+          # is to commit a regenerated package-lock.json.
+          if [ -f package-lock.json ] && npm ci --no-audit --no-fund; then
+            echo "installed from lockfile"
+          else
+            echo "::warning::npm ci failed or no lockfile — falling back to npm install. Regenerate and commit package-lock.json to restore reproducible builds."
+            npm install --no-audit --no-fund
+          fi
+          ${{ inputs.build_command }}
+          # dist/ is gitignored, so this compiled output is the entire reason the
+          # server cannot simply `git pull` and be current.
+          test -d dist || { echo "::error::build produced no dist/"; exit 1; }
+          # A stale Vite `hot` file rewrites asset URLs to localhost and silently
+          # strips all styling in production. Never ship one.
+          rm -f hot
+
+      - name: Build — static
+        if: inputs.site_type == 'static'
+        run: |
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+          ${{ inputs.build_command }}
+          test -d "${{ inputs.build_dir }}" || { echo "::error::no ${{ inputs.build_dir }}/ produced"; exit 1; }
+
+      - name: Build — node app
+        if: inputs.site_type == 'node'
+        run: |
+          npm ci --no-audit --no-fund
+          ${{ inputs.build_command }}
+          # Ship node_modules: delphi has 2 vCPU shared with 17 live sites, so
+          # installing there would spike load on production traffic.
+          npm ci --omit=dev --no-audit --no-fund
+
+      # ---- package -----------------------------------------------------------
+
+      - name: Package artifact
+        id: pack
+        run: |
+          sha="${GITHUB_SHA::7}"
+          stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          name="${{ steps.env.outputs.name }}-${stamp}-${sha}"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+          case "${{ inputs.site_type }}" in
+            wordpress)
+              # Theme only. A WP webroot also holds wp-config.php, WP core and
+              # wp-content/uploads/ — none of which belong in the artifact.
+              src="${{ steps.env.outputs.theme_dir }}" ;;
+            static)
+              src="${{ inputs.build_dir }}" ;;
+            node)
+              src="." ;;
+          esac
+
+          # node_modules is a BUILD input, not a deploy artifact — except for
+          # site_type=node, where the app runs from it. Shipping it to a
+          # WordPress theme put 392 MB inside a public web root, reachable over
+          # HTTP. Exclude it everywhere except node.
+          extra=""
+          if [ "${{ inputs.site_type }}" != "node" ]; then
+            extra="--exclude=node_modules"
+          fi
+
+          tar -czf "${name}.tar.gz" \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='node_modules/.cache' \
+            --exclude='cypress/screenshots' \
+            --exclude='cypress/videos' \
+            --exclude='.env' \
+            $extra \
+            -C "$src" .
+
+          # The server verifies this before extracting.
+          sha256sum "${name}.tar.gz" | cut -d' ' -f1 > "${name}.sha256"
+          ls -lh "${name}.tar.gz"
+
+      - name: Publish release asset
+        # dev verifies the build only — nothing is published and no client sees it.
+        if: steps.env.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Tag must start with "deploy/<env>-" so the prune step below and the
+          # servers' release-event filter both match it. Keep these in step.
+          tag="deploy/${{ steps.pack.outputs.name }}"
+          gh release create "$tag" \
+            --title "${{ steps.pack.outputs.name }}" \
+            --notes "env=${{ steps.env.outputs.name }} site_type=${{ inputs.site_type }} branch=${{ github.ref_name }} commit=${GITHUB_SHA}" \
+            --prerelease \
+            --target "${GITHUB_SHA}" \
+            "${{ steps.pack.outputs.name }}.tar.gz" \
+            "${{ steps.pack.outputs.name }}.sha256"
+
+      - name: Prune old deploy releases
+        if: steps.env.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENV_NAME: ${{ steps.env.outputs.name }}
+        run: |
+          # Keep the last 5 per environment; the servers keep their own copies for
+          # rollback, so GitHub does not need to be the long-term archive.
+          # gh has jq built in, so this needs no extra tooling.
+          gh release list --limit 100 --json tagName,createdAt \
+            --jq "[.[] | select(.tagName | startswith(\"deploy/${ENV_NAME}-\"))] | sort_by(.createdAt) | reverse | .[5:] | .[].tagName" \
+            > to-delete.txt
+
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "pruning $tag"
+            gh release delete "$tag" --yes --cleanup-tag || true
+          done < to-delete.txt
