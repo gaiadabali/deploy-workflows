@@ -119,14 +119,45 @@ jobs:
 
       # ---- build: one path per site type -------------------------------------
 
+      # setup-node's npm cache HARD FAILS when none of its cache-dependency-path
+      # entries resolve ("Some specified paths were not resolved, unable to cache
+      # dependencies"), and that killed every build in a repo with no lockfile at
+      # the root. Not a rare shape here: a repo seeded from a built docroot has no
+      # lockfile at all, and the build steps below already handle that by falling
+      # back to `npm install`. Caching is an optimisation and must never be the
+      # reason a deploy fails, so resolve the paths first and ask for the cache
+      # only when there is something to key it on.
+      - name: Find npm lockfiles
+        id: lock
+        if: inputs.site_type != 'wordpress' || inputs.theme != ''
+        run: |
+          theme_dir="${{ steps.env.outputs.theme_dir }}"
+          found=""
+          if [ -f package-lock.json ]; then found="yes"; fi
+          if [ -n "$theme_dir" ] && [ -f "$theme_dir/package-lock.json" ]; then found="yes"; fi
+
+          # Multi-line step outputs need the delimiter form.
+          {
+            echo "paths<<GAIA_LOCK_EOF"
+            if [ -f package-lock.json ]; then echo "package-lock.json"; fi
+            if [ -n "$theme_dir" ] && [ -f "$theme_dir/package-lock.json" ]; then
+              echo "$theme_dir/package-lock.json"
+            fi
+            echo "GAIA_LOCK_EOF"
+            echo "found=$found"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -z "$found" ]; then
+            echo "::warning::No package-lock.json found - npm caching is off for this run and the build will fall back to 'npm install'. Commit a lockfile for reproducible, cached installs."
+          fi
+
       - uses: actions/setup-node@v4
         if: inputs.site_type != 'wordpress' || inputs.theme != ''
         with:
           node-version: ${{ inputs.node_version }}
-          cache: npm
-          cache-dependency-path: |
-            package-lock.json
-            ${{ steps.env.outputs.theme_dir }}/package-lock.json
+          # An empty string is how setup-node is told not to cache at all.
+          cache: ${{ steps.lock.outputs.found == 'yes' && 'npm' || '' }}
+          cache-dependency-path: ${{ steps.lock.outputs.paths }}
 
       - name: Build — WordPress theme
         if: inputs.site_type == 'wordpress'
