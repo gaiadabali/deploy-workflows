@@ -75,21 +75,26 @@ jobs:
           # Publishing is inert on its own — a server only acts on the one prefix it
           # is configured for, so delphi (staging) and helios (production) ignore
           # deploy/main-* entirely.
-          case "${{ github.ref_name }}" in
+          # On a pull_request event github.ref_name is "<number>/merge", which is
+          # not a branch and would hit the error arm below. Read the base branch,
+          # and never publish from a PR - a PR is a gate, not a shipment. This is
+          # what makes "green before you promote" enforceable by the caller simply
+          # adding `pull_request:` to its own triggers.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            ref="${{ github.base_ref }}"; pub=false
+          else
+            ref="${{ github.ref_name }}";  pub=true
+          fi
+
+          case "$ref" in
             dev)
               echo "name=dev"                    >> "$GITHUB_OUTPUT"
               echo "publish=false"               >> "$GITHUB_OUTPUT" ;;
-            main)
-              echo "name=main"                   >> "$GITHUB_OUTPUT"
-              echo "publish=true"                >> "$GITHUB_OUTPUT" ;;
-            staging)
-              echo "name=staging"                >> "$GITHUB_OUTPUT"
-              echo "publish=true"                >> "$GITHUB_OUTPUT" ;;
-            production)
-              echo "name=production"             >> "$GITHUB_OUTPUT"
-              echo "publish=true"                >> "$GITHUB_OUTPUT" ;;
+            main|staging|production)
+              echo "name=$ref"                   >> "$GITHUB_OUTPUT"
+              echo "publish=$pub"                >> "$GITHUB_OUTPUT" ;;
             *)
-              echo "::error::Branch '${{ github.ref_name }}' is not a build branch (expected dev, main, staging or production)"
+              echo "::error::Branch '$ref' is not a build branch (expected dev, main, staging or production)"
               exit 1 ;;
           esac
 
@@ -117,6 +122,27 @@ jobs:
           python3 -c "import sys,yaml; yaml.safe_load(open('.gaiadeploy.yml'))" \
             || { echo "::error::.gaiadeploy.yml is not valid YAML"; exit 1; }
 
+      - name: Detect build system
+        id: build
+        run: |
+          # Not every site here is a Node project. Several repos were seeded from
+          # a live docroot and are plain static HTML with no package.json at all -
+          # danjoo-preview, natya-hotel-preview, rs3-preview, enzo-cafe-ubud.
+          # Forcing those through npm is the reason they have never produced a
+          # single artifact: every run died on setup-node, so the poller sat
+          # correctly enrolled with nothing to fetch.
+          dir="."
+          if [ "${{ inputs.site_type }}" = "wordpress" ]; then
+            dir="${{ steps.env.outputs.theme_dir }}"
+          fi
+          if [ -f "$dir/package.json" ]; then
+            echo "node=true"  >> "$GITHUB_OUTPUT"
+            echo "package.json found in '$dir' - building"
+          else
+            echo "node=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no package.json in '$dir' - packaging the source as-is, no build step"
+          fi
+
       # ---- build: one path per site type -------------------------------------
 
       # setup-node's npm cache HARD FAILS when none of its cache-dependency-path
@@ -129,7 +155,7 @@ jobs:
       # only when there is something to key it on.
       - name: Find npm lockfiles
         id: lock
-        if: inputs.site_type != 'wordpress' || inputs.theme != ''
+        if: steps.build.outputs.node == 'true' && (inputs.site_type != 'wordpress' || inputs.theme != '')
         run: |
           theme_dir="${{ steps.env.outputs.theme_dir }}"
           found=""
@@ -152,7 +178,7 @@ jobs:
           fi
 
       - uses: actions/setup-node@v4
-        if: inputs.site_type != 'wordpress' || inputs.theme != ''
+        if: steps.build.outputs.node == 'true' && (inputs.site_type != 'wordpress' || inputs.theme != '')
         with:
           node-version: ${{ inputs.node_version }}
           # An empty string is how setup-node is told not to cache at all.
@@ -160,7 +186,7 @@ jobs:
           cache-dependency-path: ${{ steps.lock.outputs.paths }}
 
       - name: Build — WordPress theme
-        if: inputs.site_type == 'wordpress'
+        if: inputs.site_type == 'wordpress' && steps.build.outputs.node == 'true'
         working-directory: ${{ steps.env.outputs.theme_dir }}
         run: |
           [ -n "${{ inputs.theme }}" ] || { echo "::error::site_type=wordpress requires the 'theme' input"; exit 1; }
@@ -182,7 +208,7 @@ jobs:
           rm -f hot
 
       - name: Build — static
-        if: inputs.site_type == 'static'
+        if: inputs.site_type == 'static' && steps.build.outputs.node == 'true'
         run: |
           if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
           ${{ inputs.build_command }}
@@ -191,6 +217,9 @@ jobs:
       - name: Build — node app
         if: inputs.site_type == 'node'
         run: |
+          # No no-build path here on purpose: a node app without a package.json
+          # is broken input, not a plain static site.
+          [ -f package.json ] || { echo "::error::site_type=node requires a package.json"; exit 1; }
           npm ci --no-audit --no-fund
           ${{ inputs.build_command }}
           # Ship node_modules: delphi has 2 vCPU shared with 17 live sites, so
@@ -213,7 +242,14 @@ jobs:
               # wp-content/uploads/ — none of which belong in the artifact.
               src="${{ steps.env.outputs.theme_dir }}" ;;
             static)
-              src="${{ inputs.build_dir }}" ;;
+              # With a build, ship its output. Without one, the repo root IS the
+              # site - unless a build_dir happens to be committed, which is how
+              # docroot-seeded repos usually look.
+              if [ "${{ steps.build.outputs.node }}" = "true" ] || [ -d "${{ inputs.build_dir }}" ]; then
+                src="${{ inputs.build_dir }}"
+              else
+                src="."
+              fi ;;
             node)
               src="." ;;
           esac
@@ -230,6 +266,7 @@ jobs:
           tar -czf "${name}.tar.gz" \
             --exclude='.git' \
             --exclude='.github' \
+            --exclude='.gaiadeploy.yml' \
             --exclude='node_modules/.cache' \
             --exclude='cypress/screenshots' \
             --exclude='cypress/videos' \
