@@ -263,7 +263,12 @@ jobs:
             extra="--exclude=node_modules"
           fi
 
-          tar -czf "${name}.tar.gz" \
+          # Write the archive OUTSIDE the tree being archived. With a no-build
+          # site src is ".", so creating the tarball in place made tar read the
+          # file it was still writing: "tar: .: file changed as we read it",
+          # exit 1. Observed on enzo-cafe-ubud 2026-08-19.
+          out="${RUNNER_TEMP}/${name}.tar.gz"
+          tar -czf "$out" \
             --exclude='.git' \
             --exclude='.github' \
             --exclude='.gaiadeploy.yml' \
@@ -273,6 +278,8 @@ jobs:
             --exclude='.env' \
             $extra \
             -C "$src" .
+
+          mv "$out" "${name}.tar.gz"
 
           # The server verifies this before extracting.
           sha256sum "${name}.tar.gz" | cut -d' ' -f1 > "${name}.sha256"
