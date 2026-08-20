@@ -271,7 +271,7 @@ jobs:
           tar -czf "$out" \
             --exclude='.git' \
             --exclude='.github' \
-            --exclude='.gaiadeploy.yml' \
+            --exclude='.gaiadeploy.yml'             --exclude='./README.md'             --exclude='./CLAUDE.md'             --exclude='./GEMINI.md'             --exclude='./DEV_WORKFLOW.md'             --exclude='./.gitignore'             --exclude='./.editorconfig'             --exclude='./.vscode'             --exclude='./.claude' \
             --exclude='node_modules/.cache' \
             --exclude='cypress/screenshots' \
             --exclude='cypress/videos' \
